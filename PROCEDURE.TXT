@@ -1,0 +1,97 @@
+# install android studio
+# install rust
+# install java jdk
+# ANDROID_NDK so that $ANDROID_NDK/build/cmake/android.toolchain.cmake is available.
+# TVM_NDK_CC: $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+# JAVA_HOME so that Java is available in $JAVA_HOME/bin/java.
+source $HOME/.cargo/env # Rust
+
+export TARGET_CUDA_VERSION=122
+
+conda env remove -n mlc-chat-venv
+
+conda create -n mlc-chat-venv -c conda-forge -c pytorch -c mlc-ai "llvmdev>=15" "cmake>=3.24" git git-lfs "python==3.11" -y
+
+conda activate mlc-chat-venv
+
+conda install -c nvidia -c pytorch huggingface_hub tokenizers pytorch pytorch-cuda transformers -y
+
+# CPU Install
+#python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-chat-nightly mlc-ai-nightly
+# GPU Install
+# https://github.com/mlc-ai/package/releases/download/v0.9.dev0/mlc_chat_nightly_cu122-0.1.dev754-cp311-cp311-manylinux_2_28_x86_64.whl
+# https://github.com/mlc-ai/package/releases/download/v0.9.dev0/mlc_ai_nightly_cu122-0.12.dev2063-cp311-cp311-manylinux_2_28_x86_64.whl
+python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-chat-nightly-cu$TARGET_CUDA_VERSION mlc-ai-nightly-cu$TARGET_CUDA_VERSION
+
+python3 -c "import tvm; print(tvm.__file__)"
+
+python3 -c "import tvm; print('\n'.join(f'{k}: {v}' for k, v in tvm.support.libinfo().items()))" | grep LLVM
+
+python3 -c "import tvm; print('\n'.join(f'{k}: {v}' for k, v in tvm.support.libinfo().items()))" | grep CUDA
+
+git clone --recursive https://github.com/TIC-13/mlc-llm.git
+
+cd mlc-llm
+
+export TVM_HOME=$(pwd)/3rdparty/tvm
+
+export MODEL_NAME=ShearedLlama2_7B
+
+export QUANTIZATION=q4f16_1
+
+export MODEL_URL=https://huggingface.co/princeton-nlp/Sheared-LLaMA-2.7B
+
+git lfs install
+
+git clone $MODEL_URL dist/models/$MODEL_NAME
+
+mlc_chat convert_weight dist/models/$MODEL_NAME --quantization $QUANTIZATION -o dist/$MODEL_NAME-$QUANTIZATION --model-type llama
+
+mlc_chat gen_config dist/models/$MODEL_NAME/ --quantization $QUANTIZATION --conv-template llama-2 -o dist/$MODEL_NAME-$QUANTIZATION/
+
+mlc_chat compile dist/$MODEL_NAME-$QUANTIZATION/mlc-chat-config.json --device cuda -o dist/libs/$MODEL_NAME-$QUANTIZATION-cuda.so
+
+mkdir -p uploaded_models && cd uploaded_models
+
+# Make sure you have an empty repo under LuxAI-CIn-Softex (hf) named $MODEL_NAME-$QUANTIZATION
+
+git clone https://huggingface.co/LuxAI-CIn-Softex/$MODEL_NAME-$QUANTIZATION
+
+cd $MODEL_NAME-$QUANTIZATION
+
+git lfs install
+
+cp ../../dist/$MODEL_NAME-$QUANTIZATION/* .
+
+git add . && git commit -m "Upload model" && git push
+
+cd ../../..
+
+export MODEL_BUILT_URL=https://huggingface.co/LuxAI-CIn-Softex/$MODEL_NAME-$QUANTIZATION
+
+python3 write_json.py $MODEL_NAME-$QUANTIZATION $MODEL_BUILT_URL
+
+cp app-config.json mlc-llm/android/MLCChat/app/src/main/assets/app-config.json
+
+cd mlc-llm/android
+
+rustup target add aarch64-linux-android
+
+chmod +x prepare_libs.sh 
+
+./prepare_libs.sh
+
+# create apk inside android studio
+
+adb devices
+
+adb install android/app/release/app-release.apk
+
+adb push dist/${MODEL_NAME}-${QUANTIZATION} /data/local/tmp/${MODEL_NAME}/
+
+adb shell "mkdir -p /storage/emulated/0/Android/data/ai.mlc.mlcchat/files/"
+
+adb shell "mv /data/local/tmp/${MODEL_NAME}-${QUANTIZATION} /storage/emulated/0/Android/data/ai.mlc.mlcchat/files/"
+
+
+

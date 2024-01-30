@@ -14,6 +14,7 @@ conda create -n mlc-chat-venv -c conda-forge -c pytorch -c mlc-ai "llvmdev>=15" 
 
 conda activate mlc-chat-venv
 
+# alterar de acordo com o site do pytorch se for instalar pra cpu
 conda install -c nvidia -c pytorch huggingface_hub tokenizers pytorch pytorch-cuda transformers -y
 
 # CPU Install
@@ -35,11 +36,19 @@ cd mlc-llm
 
 export TVM_HOME=$(pwd)/3rdparty/tvm
 
-export MODEL_NAME=ShearedLlama2_7B
+export MODEL_NAME=Sheared-LLaMA-2.7B-ShareGPT
 
 export QUANTIZATION=q4f16_1
 
-export MODEL_URL=https://huggingface.co/princeton-nlp/Sheared-LLaMA-2.7B
+export SOURCE=princeton-nlp
+
+export MODEL_URL=https://huggingface.co/$SOURCE/$MODEL_NAME
+
+export DEVICE=android
+
+export LIB_EXT=tar
+
+export TEMPLATE=wizard_coder_or_math
 
 git lfs install
 
@@ -47,9 +56,11 @@ git clone $MODEL_URL dist/models/$MODEL_NAME
 
 mlc_chat convert_weight dist/models/$MODEL_NAME --quantization $QUANTIZATION -o dist/$MODEL_NAME-$QUANTIZATION --model-type llama
 
-mlc_chat gen_config dist/models/$MODEL_NAME/ --quantization $QUANTIZATION --conv-template llama-2 -o dist/$MODEL_NAME-$QUANTIZATION/
+mlc_chat gen_config dist/models/$MODEL_NAME/ --quantization $QUANTIZATION --conv-template $TEMPLATE -o dist/$MODEL_NAME-$QUANTIZATION/
 
-mlc_chat compile dist/$MODEL_NAME-$QUANTIZATION/mlc-chat-config.json --device cuda -o dist/libs/$MODEL_NAME-$QUANTIZATION-cuda.so
+mkdir -p dist/libs
+
+mlc_chat compile dist/$MODEL_NAME-$QUANTIZATION/mlc-chat-config.json --device $DEVICE -o dist/libs/$MODEL_NAME-$QUANTIZATION-$DEVICE.$LIB_EXT
 
 mkdir -p uploaded_models && cd uploaded_models
 
@@ -63,19 +74,14 @@ git lfs install
 
 cp ../../dist/$MODEL_NAME-$QUANTIZATION/* .
 
-git add . && git commit -m "Upload model" && git push
+git add . && git commit -m "Update model" && git push
 
-cd ../../..
+cd ../../android
 
-export MODEL_BUILT_URL=https://huggingface.co/LuxAI-CIn-Softex/$MODEL_NAME-$QUANTIZATION
+cd library
 
-python3 write_json.py $MODEL_NAME-$QUANTIZATION $MODEL_BUILT_URL
-
-cp app-config.json mlc-llm/android/MLCChat/app/src/main/assets/app-config.json
-
-cd mlc-llm/android
-
-rustup target add aarch64-linux-android
+# editar de acordo com o tutorial de android
+gedit src/main/assets/app-config.json
 
 chmod +x prepare_libs.sh 
 

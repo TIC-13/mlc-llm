@@ -1,5 +1,5 @@
 """
-Implementation for GPTBigCode architecture.
+Implementation for QWEN architecture.
 TODO: add docstring
 """
 import dataclasses
@@ -11,7 +11,6 @@ from tvm.relax.frontend.nn import Tensor, op
 
 from mlc_chat import op as op_ext
 from mlc_chat.support import logging
-from mlc_chat.support import tensor_parallel as tp
 from mlc_chat.support.config import ConfigBase
 from mlc_chat.support.style import bold
 
@@ -19,16 +18,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class GPTBigCodeConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
-    """Configuration of the GPTBigCode model."""
+class QWenConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
+    """Configuration of the QWen model."""
 
-    n_embd: int
-    n_inner: int
-    n_head: int
-    n_layer: int
-    n_positions: int
-    layer_norm_epsilon: float
     vocab_size: int
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    layer_norm_epsilon: float
+    scale_attn_weights: bool
+    kv_channels: int
+    rotary_emb_base: int
+    intermediate_size: int
     context_window_size: int = 0
     prefill_chunk_size: int = 0
     tensor_parallel_shards: int = 1
@@ -36,17 +37,19 @@ class GPTBigCodeConfig(ConfigBase):  # pylint: disable=too-many-instance-attribu
 
     def __post_init__(self):
         if self.context_window_size == 0:
-            if self.n_positions > 0:
-                self.context_window_size = self.n_positions
-                logger.info(
-                    "%s not found in config.json. Falling back to %s (%d)",
-                    bold("context_window_size"),
-                    bold("n_positions"),
-                    self.context_window_size,
-                )
+            for name in ["max_position_embeddings", "max_sequence_length"]:
+                if name in self.kwargs:
+                    self.context_window_size = self.kwargs.pop(name)
+                    logger.info(
+                        "%s not found in config.json. Falling back to %s (%d)",
+                        bold("context_window_size"),
+                        bold(name),
+                        self.context_window_size,
+                    )
+                    break
             else:
                 raise ValueError(
-                    "Unable to determine the maximum sequence length, because none of "
+                    "Unable to determine the maxmimum sequence length, because none of "
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
@@ -67,47 +70,30 @@ class GPTBigCodeConfig(ConfigBase):  # pylint: disable=too-many-instance-attribu
                 bold("context_window_size"),
             )
             self.prefill_chunk_size = self.context_window_size
+        assert self.tensor_parallel_shards == 1, "QWEN currently does not support sharding."
 
 
 # pylint: disable=invalid-name,missing-docstring
 
 
-class GPTBigCodeMLP(nn.Module):
-    def __init__(self, config: GPTBigCodeConfig):
-        super().__init__()
-        self.n_inner = config.n_inner // config.tensor_parallel_shards
-        self.c_fc = nn.Linear(in_features=config.n_embd, out_features=self.n_inner, bias=True)
-        self.c_proj = nn.Linear(in_features=self.n_inner, out_features=config.n_embd, bias=True)
+class QWenAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
+    def __init__(self, config: QWenConfig):
+        self.hidden_size = config.hidden_size
+        self.rope_theta = config.rotary_emb_base
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.projection_size = config.kv_channels * config.num_attention_heads
 
-    def forward(self, x: Tensor):
-        hidden_states = self.c_fc(x)
-        hidden_states = op.gelu(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        return hidden_states
-
-
-class GPTBigCodeAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
-    def __init__(self, config: GPTBigCodeConfig):
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-        self.num_q_heads = config.n_head // config.tensor_parallel_shards
-        self.num_kv_heads = 1
-        assert (
-            config.tensor_parallel_shards == 1
-        ), "GPT bigcode only support tensor parallel shards = 1"
         self.c_attn = nn.Linear(
-            in_features=self.n_embd,
-            out_features=(self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim,
+            in_features=config.hidden_size,
+            out_features=3 * self.projection_size,
             bias=True,
         )
-        self.c_proj = nn.Linear(
-            in_features=self.num_q_heads * self.head_dim,
-            out_features=config.n_embd,
-            bias=True,
-        )
+        self.c_proj = nn.Linear(config.hidden_size, self.projection_size, bias=False)
 
-        self.k_cache = nn.KVCache(config.context_window_size, [self.num_kv_heads, self.head_dim])
-        self.v_cache = nn.KVCache(config.context_window_size, [self.num_kv_heads, self.head_dim])
+        # KV cache for single sequence
+        self.k_cache = nn.KVCache(config.context_window_size, [self.num_heads, self.head_dim])
+        self.v_cache = nn.KVCache(config.context_window_size, [self.num_heads, self.head_dim])
 
     def forward(  # pylint: disable=too-many-locals
         self,
@@ -115,98 +101,77 @@ class GPTBigCodeAttention(nn.Module):  # pylint: disable=too-many-instance-attri
         attention_mask: Tensor,
         total_seq_len: tir.Var,
     ):
-        d, h_q, h_kv, t = self.head_dim, self.num_q_heads, self.num_kv_heads, total_seq_len
+        d, h, t = self.head_dim, self.num_heads, total_seq_len
         b, s, _ = hidden_states.shape
         assert b == 1, "Only support batch size 1 at this moment."
-
+        # Step 1. QKV Projection
         qkv = self.c_attn(hidden_states)
-        qkv = op.reshape(qkv, (b, s, h_q + 2 * h_kv, d))
-        q, k, v = op.split(qkv, indices_or_sections=[h_q, h_q + h_kv], axis=2)
-
+        qkv = op.reshape(qkv, (b, s, 3 * h, d))
+        # Step 2. Apply QK rotary embedding
+        q, k, v = op_ext.llama_rope(qkv, t, self.rope_theta, h, h)
+        # Step 3. Query and update KVCache
         self.k_cache.append(op.squeeze(k, axis=0))
         self.v_cache.append(op.squeeze(v, axis=0))
         k = self.k_cache.view(t)
         v = self.v_cache.view(t)
+        # Step 4. Compute softmax(Q @ K^T / sqrt(d)) @ V
         output = op_ext.attention(q, k, v, casual_mask=attention_mask)
+        # Step 5. Apply output projection
         return self.c_proj(output)
 
 
-class GPTBigCodeBlock(nn.Module):
-    def __init__(self, config: GPTBigCodeConfig):
-        self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        self.attn = GPTBigCodeAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        self.mlp = GPTBigCodeMLP(config)
+class QWenMLP(nn.Module):
+    def __init__(self, config: QWenConfig):
+        self.intermediate_size = config.intermediate_size
+        self.gate_up_proj = nn.Linear(
+            in_features=config.hidden_size,
+            out_features=self.intermediate_size,
+            bias=False,
+        )
+        self.c_proj = nn.Linear(self.intermediate_size // 2, config.hidden_size, bias=False)
 
-        def _set_tp():
-            def _set(layer, hint):
-                layer.weight.attrs["shard_strategy"] = hint
+    def forward(self, x: Tensor):
+        concat_x1_x2 = self.gate_up_proj(x)
+        x1, x2 = op.split(concat_x1_x2, 2, axis=-1)
+        return self.c_proj(x1 * op.silu(x2))
 
-            hd = config.n_embd // config.n_head
-            q = config.n_head * hd
-            k = 1 * hd
-            v = 1 * hd
-            _set(self.attn.c_attn, tp.ShardSingleDim("_shard_c_attn", dim=0, segs=[q, k, v]))
-            _set(self.attn.c_proj, tp.ShardSingleDim("_shard_c_proj", dim=1))
-            _set(self.mlp.c_fc, tp.ShardSingleDim("_shard_mlp_c_fc", dim=0))
-            _set(self.mlp.c_proj, tp.ShardSingleDim("_shard_mlp_c_proj", dim=1))
 
-        self.tensor_parallel_shards = config.tensor_parallel_shards
-        _set_tp()
+class QWenBlock(nn.Module):
+    def __init__(self, config: QWenConfig):
+        rms_norm_eps = config.layer_norm_epsilon
+        self.attn = QWenAttention(config)
+        self.mlp = QWenMLP(config)
+        self.ln_1 = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
+        self.ln_2 = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
 
     def forward(self, hidden_states: Tensor, attention_mask: Tensor, total_seq_len: tir.Var):
-        hidden_states = (
-            self.attn(self.ln_1(hidden_states), attention_mask, total_seq_len) + hidden_states
-        )
-        hidden_states = self.mlp(self.ln_2(hidden_states)) + hidden_states
+        out = self.attn(self.ln_1(hidden_states), attention_mask, total_seq_len)
+        hidden_states = out + hidden_states
+        out = self.mlp(self.ln_2(hidden_states))
+        hidden_states = out + hidden_states
         return hidden_states
 
 
-class GPTBigCodeModel(nn.Module):
-    def __init__(self, config: GPTBigCodeConfig):
-        assert config.n_embd % config.n_head == 0
-        self.wte = nn.Embedding("vocab_size", config.n_embd)
-        self.wpe = nn.Embedding(config.n_positions, config.n_embd)
-        self.h = nn.ModuleList([GPTBigCodeBlock(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        self.tensor_parallel_shards = config.tensor_parallel_shards
+class QWenModel(nn.Module):
+    def __init__(self, config: QWenConfig):
+        assert config.hidden_size % config.num_attention_heads == 0
+        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.h = nn.ModuleList([QWenBlock(config) for _ in range(config.num_hidden_layers)])
+        self.ln_f = nn.RMSNorm(config.hidden_size, -1, config.layer_norm_epsilon, bias=False)
 
-    def forward(self, inputs: Tensor, total_seq_len: tir.Var, attention_mask: Tensor):
-        if self.tensor_parallel_shards > 1:
-            inputs = op.ccl_broadcast_from_worker0(inputs)
-
-        # Token Embeddings
-        t_embd = self.wte(inputs)
-
-        # Position Embeddings
-        # Generate np.arange(offset, offset+seq_len)
-        def _input_positions(inputs: te.Tensor, total_seq_len: tir.Var):
-            b, s = inputs.shape
-            offset = total_seq_len - s
-            return te.compute(
-                (b, s), lambda _, j: (offset + j).astype("int32"), name="input_positions"
-            )
-
-        input_positions = op.tensor_expr_op(
-            _input_positions,
-            name_hint="input_positions",
-            args=[inputs, total_seq_len],
-        )
-        pos_embd = self.wpe(input_positions)
-
-        # apply position embeddings
-        hidden_states = t_embd + pos_embd
+    def forward(self, input_ids: Tensor, total_seq_len: tir.Var, attention_mask: Tensor):
+        hidden_states = self.wte(input_ids)
         for layer in self.h:
             hidden_states = layer(hidden_states, attention_mask, total_seq_len)
         hidden_states = self.ln_f(hidden_states)
-
         return hidden_states
 
 
-class GPTBigCodeForCausalLM(nn.Module):
-    def __init__(self, config: GPTBigCodeConfig):
-        self.transformer = GPTBigCodeModel(config)
-        self.lm_head = nn.Linear(config.n_embd, "vocab_size", bias=False)
+class QWenLMHeadModel(nn.Module):
+    def __init__(self, config: QWenConfig):
+        self.transformer = QWenModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.vocab_size = config.vocab_size
         self.dtype = "float32"
 
     def to(self, dtype: Optional[str] = None):

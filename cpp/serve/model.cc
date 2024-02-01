@@ -3,9 +3,6 @@
  * \file serve/model.cc
  * \brief The implementation of runtime module of LLM functions (prefill/decode/etc.)
  */
-#define PICOJSON_USE_INT64
-#define __STDC_FORMAT_MACROS
-
 #include "model.h"
 
 #include <picojson.h>
@@ -122,8 +119,9 @@ class ModelImpl;
 
 TVM_REGISTER_OBJECT_TYPE(ModelObj);
 
-Model Model::Create(TVMArgValue reload_lib, String model_path, DLDevice device) {
-  return Model(make_object<ModelImpl>(reload_lib, model_path, device));
+Model Model::Create(TVMArgValue reload_lib, String model_path, DLDevice device,
+                    int max_num_sequence) {
+  return Model(make_object<ModelImpl>(reload_lib, model_path, device, max_num_sequence));
 }
 
 class ModelImpl : public ModelObj {
@@ -132,23 +130,28 @@ class ModelImpl : public ModelObj {
    * \brief Constructor of ModelImpl.
    * \sa Model::Create
    */
-  explicit ModelImpl(TVMArgValue reload_lib, String model_path, DLDevice device) : device_(device) {
+  explicit ModelImpl(TVMArgValue reload_lib, String model_path, DLDevice device,
+                     int max_num_sequence)
+      : device_(device) {
     // Step 1. Process model config json string.
+    picojson::object model_config;
     {
       std::ifstream config_istream((model_path + "/mlc-chat-config.json").c_str());
       std::ostringstream config_ostream;
       ICHECK(config_istream);
       config_ostream << config_istream.rdbuf();
       std::string config_str = config_ostream.str();
-      LoadModelConfigJSON(config_str);
+      model_config = LoadModelConfigJSON(config_str);
     }
     // Step 2. Initialize vm, we use the packed function mechanism
     // so there is no explicit abi dependency on these extra
     // classes other than basic tvm runtime.
-    this->ft_.Init(reload_lib, device_, num_shards_);
+    this->ft_.Init(reload_lib, device_, model_config);
     // Step 3. Load params in nd-array cache.
     this->params_ = ft_.LoadParams(model_path, device_);
-    // Step 4. Reset
+    // Step 4. Set max_num_sequence
+    this->max_num_sequence_ = max_num_sequence;
+    // Step 5. Reset
     this->Reset();
   }
 
@@ -168,7 +171,7 @@ class ModelImpl : public ModelObj {
     CHECK(ft_.embed_func_.defined())
         << "`embed` function is not found in the model. Please make sure the model is compiled "
            "with flag `--sep-embed` and `--enable-batching`";
-    auto token_ids_dref_or_nd = ft_.CopyToWorker0(token_ids_nd);
+    auto token_ids_dref_or_nd = ft_.CopyToWorker0(token_ids_nd, "token_ids", {max_window_size_});
 
     ObjectRef embeddings = ft_.embed_func_(token_ids_dref_or_nd, params_);
     NDArray embeddings_ndarray;
@@ -221,8 +224,10 @@ class ModelImpl : public ModelObj {
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
 
-    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(embeddings);
-    ObjectRef logit_pos_dref_or_nd = ft_.CopyToWorker0(logit_pos_nd);
+    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(
+        embeddings, "embedding_prefill", {1, max_window_size_, embeddings.Shape()[2]});
+    ObjectRef logit_pos_dref_or_nd =
+        ft_.CopyToWorker0(logit_pos_nd, "logit_pos", {max_num_sequence_});
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef ret =
         ft_.prefill_func_(embeddings_dref_or_nd, logit_pos_dref_or_nd, kv_cache_, params_);
@@ -264,7 +269,8 @@ class ModelImpl : public ModelObj {
     IntTuple lengths_tuple(std::vector<int64_t>(/*n=*/embeddings->shape[0], /*v=*/1));
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
 
-    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(embeddings);
+    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(
+        embeddings, "embedding_decode", {max_num_sequence_, 1, embeddings.Shape()[2]});
 
     // args: embeddings, kv_cache, params
     ObjectRef ret = ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, params_);
@@ -314,7 +320,8 @@ class ModelImpl : public ModelObj {
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
 
-    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(embeddings);
+    ObjectRef embeddings_dref_or_nd = ft_.CopyToWorker0(
+        embeddings, "embedding_verify", {1, max_window_size_, embeddings.Shape()[2]});
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef ret = ft_.verify_func_(embeddings_dref_or_nd, kv_cache_, params_);
     NDArray logits;
@@ -365,8 +372,10 @@ class ModelImpl : public ModelObj {
   void CreateKVCache(KVCacheConfig kv_cache_config) final {
     IntTuple max_num_sequence{kv_cache_config->max_num_sequence};
     IntTuple max_total_sequence_length{kv_cache_config->max_total_sequence_length};
+    IntTuple prefill_chunk_size{kv_cache_config->prefill_chunk_size};
     IntTuple page_size{kv_cache_config->page_size};
-    kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length, page_size);
+    kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length,
+                                          prefill_chunk_size, page_size);
   }
 
   void AddNewSequence(int64_t seq_id) final { ft_.kv_cache_add_sequence_func_(kv_cache_, seq_id); }
@@ -407,7 +416,7 @@ class ModelImpl : public ModelObj {
 
  private:
   /*! \brief Load model configuration from JSON. */
-  void LoadModelConfigJSON(const std::string& config_str) {
+  picojson::object LoadModelConfigJSON(const std::string& config_str) {
     picojson::value config_json;
     std::string err = picojson::parse(config_json, config_str);
     if (!err.empty()) {
@@ -416,26 +425,20 @@ class ModelImpl : public ModelObj {
 
     // Get json fields.
     picojson::object config = config_json.get<picojson::object>();
-    if (config.count("tensor_parallel_shards")) {
-      CHECK(config["tensor_parallel_shards"].is<int64_t>());
-      this->num_shards_ = config["tensor_parallel_shards"].get<int64_t>();
-    } else {
-      this->num_shards_ = 1;
-    }
     if (config.count("context_window_size")) {
       CHECK(config["context_window_size"].is<int64_t>());
       this->max_window_size_ = config["context_window_size"].get<int64_t>();
     } else {
       LOG(FATAL) << "Key \"context_window_size\" not found.";
     }
+    return config;
   }
 
   //----------------------------
   // Model configurations
   //----------------------------
-  int num_shards_ = -1;
   int max_window_size_ = -1;
-
+  int max_num_sequence_ = -1;
   //----------------------------
   // TVM related states
   //----------------------------

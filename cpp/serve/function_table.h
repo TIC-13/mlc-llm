@@ -7,6 +7,7 @@
 #ifndef MLC_LLM_SERVE_FUNCTION_TABLE_H_
 #define MLC_LLM_SERVE_FUNCTION_TABLE_H_
 
+#include <picojson.h>
 #include <tvm/runtime/disco/session.h>
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/ndarray.h>
@@ -40,7 +41,7 @@ using namespace tvm::runtime;
 struct FunctionTable {
   static PackedFunc SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name);
 
-  void Init(TVMArgValue reload_lib, Device device, int num_shards);
+  void Init(TVMArgValue reload_lib, Device device, picojson::object model_config);
 
   ObjectRef LoadParams(const std::string& model_path, Device device);
 
@@ -48,12 +49,15 @@ struct FunctionTable {
 
   ObjectRef Empty(ShapeTuple shape, DataType dtype, Device device) const;
 
-  ObjectRef CopyToWorker0(const NDArray& host_array);
+  ObjectRef CopyToWorker0(const NDArray& host_array, String tensor_name,
+                          ShapeTuple max_reserved_shape);
 
   bool use_disco = false;
   Session sess{nullptr};
   DRef disco_mod{nullptr};
+  Map<String, DRef> disco_buffers;
   tvm::runtime::Module local_vm{nullptr};
+  picojson::object model_config;
 
   TypedPackedFunc<PackedFunc(const std::string&)> mod_get_func;
   TypedPackedFunc<PackedFunc(const std::string&)> get_global_func;
@@ -75,6 +79,7 @@ struct FunctionTable {
   PackedFunc kv_cache_attention_func_;
   PackedFunc kv_cache_popn_func_;
   PackedFunc kv_cache_get_num_available_pages_func_;
+  PackedFunc view_func_;
 };
 
 }  // namespace serve

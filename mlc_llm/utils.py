@@ -26,6 +26,8 @@ supported_model_types = set(
         "chatglm",
         "mistral",
         "stablelm_epoch",
+        "gpt2",
+        "qwen"
     ]
 )
 
@@ -122,6 +124,7 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
         "tinyllama": "chatml",
         "openhermes-2.5-mistral": "open_hermes_mistral",
         "neuralhermes-2.5-mistral": "neural_hermes_mistral",
+        "qwen": "qwen"
     }
 
     for prefix, conv_template in model_conv_templates.items():
@@ -333,6 +336,21 @@ def load_params(artifact_path: str, device) -> List[tvm.nd.NDArray]:
     size = meta["ParamSize"]
     for i in range(size):
         plist.append(params[f"param_{i}"])
+    return plist
+
+
+def load_params_SLM(
+    model_weight_path: str, device, model_metadata: Dict[str, Any]
+) -> List[tvm.nd.NDArray]:
+    from tvm.contrib import tvmjs  # pylint: disable=import-outside-toplevel
+
+    params, meta = tvmjs.load_ndarray_cache(model_weight_path, device)
+    param_names = [param["name"] for param in model_metadata["params"]]
+    assert len(param_names) == meta["ParamSize"]
+
+    plist = []
+    for param_name in param_names:
+        plist.append(params[param_name])
     return plist
 
 

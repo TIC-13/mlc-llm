@@ -41,8 +41,19 @@ PackedFunc FunctionTable::SessionFuncAsPackedFunc(Session sess, DRef sess_func, 
   });
 }
 
-void FunctionTable::Init(TVMArgValue reload_lib, Device device, int num_shards) {
+void FunctionTable::Init(TVMArgValue reload_lib, Device device, picojson::object model_config) {
   Device null_device{DLDeviceType(0), 0};
+  int num_shards;
+  {
+    if (model_config.count("tensor_parallel_shards")) {
+      CHECK(model_config["tensor_parallel_shards"].is<int64_t>());
+      num_shards = model_config["tensor_parallel_shards"].get<int64_t>();
+    } else {
+      num_shards = 1;
+    }
+  }
+  this->model_config = model_config;
+
   if (num_shards > 1) {
     String lib_path{nullptr};
     try {
@@ -93,7 +104,7 @@ void FunctionTable::Init(TVMArgValue reload_lib, Device device, int num_shards) 
     {
       Module mod = this->disco_mod->DebugGetFromRemote(0);
       this->softmax_func_ = mod->GetFunction("softmax_with_temperature");
-      this->model_metadata_ = ModelMetadata::FromModule(mod);
+      this->model_metadata_ = ModelMetadata::FromModule(mod, std::move(model_config));
     }
   } else {
     Module executable{nullptr};
@@ -119,7 +130,7 @@ void FunctionTable::Init(TVMArgValue reload_lib, Device device, int num_shards) 
       CHECK(f != nullptr) << "ValueError: Cannot find function " << name;
       return *f;
     };
-    this->model_metadata_ = ModelMetadata::FromModule(this->local_vm);
+    this->model_metadata_ = ModelMetadata::FromModule(this->local_vm, std::move(model_config));
     this->_InitFunctions();
   }
 }
@@ -141,7 +152,7 @@ ObjectRef FunctionTable::LoadParams(const std::string& model_path, Device device
       params = loader_load_all(loader);
     } else {
       PackedFunc loader = this->get_global_func("mlc.loader.LoadMultiGPU");
-      params = loader(model_path, this->disco_mod);
+      params = loader(model_path, this->disco_mod, picojson::value(this->model_config).serialize());
     }
     return params;
   } else {
@@ -199,6 +210,7 @@ void FunctionTable::_InitFunctions() {
   this->kv_cache_popn_func_ = get_global_func("vm.builtin.paged_attention_kv_cache_popn");
   this->kv_cache_get_num_available_pages_func_ =
       get_global_func("vm.builtin.paged_attention_kv_cache_get_num_available_pages");
+  this->view_func_ = get_global_func("vm.builtin.reshape");
   support_backtracking_kv_ = true;
 }
 
@@ -212,13 +224,21 @@ ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) 
   }
 }
 
-ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array) {
+ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String tensor_name,
+                                       ShapeTuple max_reserved_shape) {
   Device null_device{DLDeviceType(0), 0};
   if (this->use_disco) {
-    DRef array =
-        Downcast<DRef>(this->Empty(host_array.Shape(), host_array.DataType(), null_device));
-    sess->CopyToWorker0(host_array, array);
-    return array;
+    DRef buffer(nullptr);
+    if (this->disco_buffers.count(tensor_name)) {
+      buffer = this->disco_buffers[tensor_name];
+    } else {
+      buffer = Downcast<DRef>(this->Empty(max_reserved_shape, host_array.DataType(), null_device));
+      this->disco_buffers.Set(tensor_name, buffer);
+    }
+    ShapeTuple real_shape = host_array.Shape();
+    DRef buffer_view = view_func_(buffer, real_shape);
+    sess->CopyToWorker0(host_array, buffer_view);
+    return buffer_view;
   } else {
     return host_array;
   }

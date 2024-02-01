@@ -70,7 +70,7 @@ def topk(x: Tensor, k: int) -> Tuple[Tensor, Tensor]:
         local_top_k = T.alloc_buffer((SCAN_LEN,), dtype=dtype, scope="local")
         local_top_k_index = T.alloc_buffer((SCAN_LEN,), dtype=index_dtype, scope="local")
         for io in T.thread_binding(0, T.ceildiv(batch_size, TX), "blockIdx.x"):
-            for ii in T.thread_binding(0, T.min(batch_size, TX), "threadIdx.x"):
+            for ii in T.thread_binding(0, TX, "threadIdx.x"):
                 with T.block("top_k"):
                     vi = T.axis.spatial(batch_size, io * TX + ii)
                     T.where(io * TX + ii < batch_size)
@@ -131,8 +131,8 @@ def moe_cumsum(expert_indices: Tensor, num_local_experts: int) -> Tensor:
 
     Returns
     -------
-    topk_mask : Tensor
-        The boolean mask with shape [batch_size, num_local_experts], int32.
+    cumsum: Tensor
+        The cumsum result with shape [num_local_experts * batch_size], int32.
 
     Example
     -------
@@ -237,12 +237,12 @@ def get_indices(cumsum: Tensor, expert_indices: Tensor) -> Tensor:
         cumsum = T.match_buffer(var_cumsum, [cumsum_len], "int32")
         expert_indices = T.match_buffer(var_expert_indices, [batch_size, experts_per_tok], "int32")
         indices = T.match_buffer(var_indices, [batch_size * experts_per_tok], "int32")
-        for bj_o in T.thread_binding(0, T.ceildiv(cumsum_len, TX), "blockIdx.x"):
+        for bj_o in T.thread_binding(0, T.ceildiv(batch_size * experts_per_tok, TX), "blockIdx.x"):
             for bj_i in T.thread_binding(0, TX, "threadIdx.x"):
                 with T.block("indices"):
                     T.reads(expert_indices[:, :], cumsum[:])
                     T.writes(indices[:])
-                    if bj_o * TX + bj_i < cumsum_len:
+                    if bj_o * TX + bj_i < batch_size * experts_per_tok:
                         b: T.int32 = T.floordiv(bj_o * TX + bj_i, experts_per_tok)
                         j: T.int32 = T.floormod(bj_o * TX + bj_i, experts_per_tok)
                         e: T.int32 = expert_indices[b, j]

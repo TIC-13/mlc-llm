@@ -13,6 +13,7 @@ from tvm.target import Target
 
 from mlc_chat import compiler_pass as _
 from mlc_chat import op as op_ext
+from mlc_chat.cli.model_metadata import _report_memory_usage
 from mlc_chat.model import Model
 from mlc_chat.quantization import Quantization
 from mlc_chat.support import logging
@@ -101,7 +102,8 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
     def _get_param_metadata(name: str, param: nn.Parameter) -> Dict[str, Any]:
         return {
             "name": name,
-            "shape": list(param.shape),
+            # Record dynamic shape as -1 (e.g. vocab_size)
+            "shape": [s if isinstance(s, int) else s.name for s in param.shape],
             "dtype": param.dtype,
             "preprocs": param.attrs["preprocs"],
         }
@@ -184,6 +186,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
                 debug_dump=args.debug_dump,
             ),
         )
+        _report_memory_usage(metadata=metadata, config=model_config)
     logger.info("Generated: %s", bold(str(args.output)))
 
 

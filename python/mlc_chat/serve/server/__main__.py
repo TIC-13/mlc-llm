@@ -18,7 +18,8 @@ def parse_args_and_initialize() -> argparse.Namespace:
     args.add_argument("--model-lib-path", type=str, required=True)
     args.add_argument("--device", type=str, default="auto")
     args.add_argument("--max-batch-size", type=int, default=80)
-    args.add_argument("--max-total-seq-length", type=int, default=16800)
+    args.add_argument("--max-total-seq-length", type=int)
+    args.add_argument("--prefill-chunk-size", type=int)
     args.add_argument("--enable-tracing", action="store_true")
 
     args.add_argument("--host", type=str, default="127.0.0.1", help="host name")
@@ -29,7 +30,6 @@ def parse_args_and_initialize() -> argparse.Namespace:
     args.add_argument("--allowed-headers", type=json.loads, default=["*"], help="allowed headers")
 
     parsed = args.parse_args()
-    assert parsed.max_total_seq_length >= 2048
 
     # Initialize model loading info and KV cache config
     model_info = async_engine.ModelInfo(
@@ -40,6 +40,7 @@ def parse_args_and_initialize() -> argparse.Namespace:
     kv_cache_config = config.KVCacheConfig(
         max_num_sequence=parsed.max_batch_size,
         max_total_sequence_length=parsed.max_total_seq_length,
+        prefill_chunk_size=parsed.prefill_chunk_size,
     )
     # Create engine and start the background loop
     engine = async_engine.AsyncThreadedEngine(

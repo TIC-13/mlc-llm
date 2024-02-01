@@ -2,6 +2,7 @@
 Acknowledgment: Part of the code was adapted from the vLLM project.
 """
 import asyncio
+import sys
 import threading
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
@@ -11,7 +12,7 @@ from ..streamer import StopStringHandler, TextStreamer
 from ..tokenizer import Tokenizer
 from . import data
 from .config import EngineMode, GenerationConfig, KVCacheConfig
-from .engine import ModelInfo, _process_model_args
+from .engine import ModelInfo, _estimate_max_total_sequence_length, _process_model_args
 from .event_trace_recorder import EventTraceRecorder
 from .request import Request, RequestStreamOutput
 
@@ -33,9 +34,12 @@ class AsyncRequestStream:
     #   delta output text, the number of delta tokens, the optional
     #   finish reason respectively,
     # - or an exception.
-    _queue: asyncio.Queue[  # pylint: disable=unsubscriptable-object
-        Union[Tuple[str, int, Optional[str]], Exception]
-    ]
+    if sys.version_info >= (3, 9):
+        _queue: asyncio.Queue[  # pylint: disable=unsubscriptable-object
+            Union[Tuple[str, int, Optional[str]], Exception]
+        ]
+    else:
+        _queue: asyncio.Queue
     # The finish flag.
     _finished: bool
 
@@ -106,13 +110,31 @@ class AsyncThreadedEngine:  # pylint: disable=too-many-instance-attributes
         engine_mode: Optional[EngineMode] = None,
         enable_tracing: bool = False,
     ) -> None:
+        if isinstance(models, ModelInfo):
+            models = [models]
         (
             model_args,
+            config_file_paths,
             tokenizer_path,
             self.max_single_sequence_length,
+            prefill_chunk_size,
             self.conv_template_name,
         ) = _process_model_args(models)
         self.trace_recorder = EventTraceRecorder() if enable_tracing else None
+
+        if kv_cache_config.max_total_sequence_length is None:
+            kv_cache_config.max_total_sequence_length = _estimate_max_total_sequence_length(
+                models, config_file_paths
+            )
+        if kv_cache_config.prefill_chunk_size is None:
+            kv_cache_config.prefill_chunk_size = prefill_chunk_size
+        elif kv_cache_config.prefill_chunk_size > prefill_chunk_size:
+            raise ValueError(
+                f"The specified prefill chunk size {kv_cache_config.prefill_chunk_size} is "
+                f"larger than the maximum prefill chunk size {prefill_chunk_size} supported by "
+                "models. Please specify a smaller prefill chunk size."
+            )
+
         module = tvm.get_global_func("mlc.serve.create_threaded_engine", allow_missing=False)()
         self._ffi = {
             key: module[key]

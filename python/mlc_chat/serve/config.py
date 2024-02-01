@@ -86,14 +86,21 @@ class KVCacheConfig:
         The maximum number of sequences that are allowed to processed by the KV
         cache at any time.
 
-    max_total_sequence_length : int
+    max_total_sequence_length : Optional[int]
         The maximum total number of tokens whose KV data are allowed to exist
         in the KV cache at any time.
+        Set it to None to enable automatic computation of the max total
+        sequence length.
+
+    prefill_chunk_size : Optional[int]
+        The maximum total sequence length in a prefill.
+        If not specified, it will be automatically inferred from model config.
     """
 
     page_size: int = 16
     max_num_sequence: int = 32
-    max_total_sequence_length: int = 16384
+    max_total_sequence_length: Optional[int] = None
+    prefill_chunk_size: Optional[int] = None
 
     def asjson(self) -> str:
         """Return the config in string of JSON format."""

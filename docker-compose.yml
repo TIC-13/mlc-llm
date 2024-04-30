@@ -1,0 +1,25 @@
+services:
+  
+  mlc_image:
+    
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    volumes:
+      - type: bind
+        source: ./
+        target: /volume
+        bind:
+          propagation: shared
+    
+    container_name: mlc_container
+
+
+#####################################################################
+# To run the docker compose FOR THE FIRST TIME use these commands
+#   docker compose up --build
+#
+# To run the docker compose AFTER THE FIRST TIME use these commands
+#   docker compose run --rm mlc_image /bin/bash
+#####################################################################

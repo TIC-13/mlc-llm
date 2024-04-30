@@ -1,3 +1,11 @@
+## Clone this repository recursively
+
+```bash
+git clone --recursive git@github.com:TIC-13/mlc-llm.git
+```
+
+---
+
 [discord-url]: https://discord.gg/9Xpy2HGBuD
 
 # MLC LLM

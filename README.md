@@ -1,7 +1,7 @@
 ## Clone this repository recursively
 
 ```bash
-git clone --recursive git@github.com:TIC-13/mlc-llm.git
+git clone --recursive --jobs=8 git@github.com:TIC-13/mlc-llm.git
 ```
 
 ---

@@ -6,4 +6,4 @@ cd ${MLC_LLM_HOME}/build/
 
 python3 ../cmake/gen_cmake_config.py
 
-cmake .. && cmake --build . --parallel $(nproc) && cd ..
+cmake .. && cmake --build . --parallel $(($(nproc) - 1)) && cd ..

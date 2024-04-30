@@ -13,6 +13,7 @@
 
 #include <fstream>
 
+#include "config.h"
 #include "logit_processor.h"
 
 namespace mlc {
@@ -25,10 +26,27 @@ class ModelImpl;
 
 TVM_REGISTER_OBJECT_TYPE(ModelObj);
 
-Model Model::Create(String reload_lib_path, String model_path, DLDevice device,
-                    int max_num_sequence, bool trace_enabled) {
-  return Model(
-      make_object<ModelImpl>(reload_lib_path, model_path, device, max_num_sequence, trace_enabled));
+Model Model::Create(String reload_lib_path, String model_path, const picojson::object& model_config,
+                    DLDevice device, int max_num_sequence, const Optional<Session>& session,
+                    bool trace_enabled) {
+  return Model(make_object<ModelImpl>(reload_lib_path, model_path, model_config, device,
+                                      max_num_sequence, session, trace_enabled));
+}
+
+picojson::object Model::LoadModelConfig(const String& model_path) {
+  picojson::object model_config;
+  std::ifstream config_istream((model_path + "/mlc-chat-config.json").c_str());
+  std::ostringstream config_ostream;
+  ICHECK(config_istream);
+  config_ostream << config_istream.rdbuf();
+  std::string config_str = config_ostream.str();
+  picojson::value config_json;
+  std::string err = picojson::parse(config_json, config_str);
+  if (!err.empty()) {
+    LOG(FATAL) << err;
+  }
+  picojson::object config = config_json.get<picojson::object>();
+  return config;
 }
 
 class ModelImpl : public ModelObj {
@@ -37,23 +55,16 @@ class ModelImpl : public ModelObj {
    * \brief Constructor of ModelImpl.
    * \sa Model::Create
    */
-  explicit ModelImpl(String reload_lib_path, String model_path, DLDevice device,
-                     int max_num_sequence, bool trace_enabled)
+  explicit ModelImpl(String reload_lib_path, String model_path, picojson::object model_config,
+                     DLDevice device, int max_num_sequence, const Optional<Session>& session,
+                     bool trace_enabled)
       : device_(device) {
     // Step 1. Process model config json string.
-    picojson::object model_config;
-    {
-      std::ifstream config_istream((model_path + "/mlc-chat-config.json").c_str());
-      std::ostringstream config_ostream;
-      ICHECK(config_istream);
-      config_ostream << config_istream.rdbuf();
-      std::string config_str = config_ostream.str();
-      model_config = LoadModelConfigJSON(config_str);
-    }
+    LoadModelConfigJSON(model_config);
     // Step 2. Initialize vm, we use the packed function mechanism
     // so there is no explicit abi dependency on these extra
     // classes other than basic tvm runtime.
-    this->ft_.Init(reload_lib_path, device_, model_config);
+    this->ft_.Init(reload_lib_path, device_, model_config, session);
     // Step 3. Load params in nd-array cache.
     this->params_ = ft_.LoadParams(model_path, device_);
     // Step 4. Set max_num_sequence
@@ -68,6 +79,12 @@ class ModelImpl : public ModelObj {
     token_ids_storage_ = memory::Storage(
         allocator->Alloc(device_host, {prefill_chunk_size_}, DataType::Int(32)), allocator);
     this->logit_pos_arr_ = NDArray::Empty({max_num_sequence}, DataType::Int(32), device_host);
+    // Step 7. Set model type
+    if (model_config["model_type"].get<std::string>().find("rwkv") != std::string::npos) {
+      this->kind = KVStateKind::kRNNState;
+    } else {
+      this->kind = KVStateKind::kAttention;
+    }
   }
 
   /*********************** Model Computation  ***********************/
@@ -229,14 +246,8 @@ class ModelImpl : public ModelObj {
     }
     NDArray logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
 
-    // This step runs on the engine thread.
-    // By temporarily turning off the disco flag, this copies the logit_pos_nd to the cached device
-    // tensor without actually copying to the worker.
-    bool use_disco = ft_.use_disco;
-    ft_.use_disco = false;
-    ObjectRef logit_pos_dref_or_nd =
-        ft_.CopyToWorker0(logit_pos_nd, "logit_pos", {max_num_sequence_});
-    ft_.use_disco = use_disco;
+    ObjectRef logit_pos_dref_or_nd = ft_.CopyToWorker0(logit_pos_nd, "logit_pos_local",
+                                                       {max_num_sequence_}, /*local_only=*/true);
 
     CHECK(ft_.batch_select_last_hidden_func_.defined())
         << "`batch_select_last_hidden_states` function is not found in the model.";
@@ -739,16 +750,26 @@ class ModelImpl : public ModelObj {
   /*********************** KV Cache Management  ***********************/
 
   void CreateKVCache(int page_size, int max_num_sequence, int max_total_sequence_length,
-                     int prefill_chunk_size) final {
-    IntTuple max_num_sequence_tuple{max_num_sequence};
-    IntTuple max_total_sequence_length_tuple{max_total_sequence_length};
-    IntTuple prefill_chunk_size_tuple{prefill_chunk_size};
-    IntTuple page_size_tuple{page_size};
-    IntTuple support_sliding_window{sliding_window_size_ != -1};
-    kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence_tuple, max_total_sequence_length_tuple,
-                                          prefill_chunk_size_tuple, page_size_tuple,
-                                          support_sliding_window);
-    local_kv_cache_ = ft_.use_disco ? Downcast<DRef>(kv_cache_)->DebugGetFromRemote(0) : kv_cache_;
+                     int prefill_chunk_size, int max_history_size,
+                     KVStateKind kv_state_kind) final {
+    if (kv_state_kind == KVStateKind::kAttention) {
+      IntTuple max_num_sequence_tuple{max_num_sequence};
+      IntTuple max_total_sequence_length_tuple{max_total_sequence_length};
+      IntTuple prefill_chunk_size_tuple{prefill_chunk_size};
+      IntTuple page_size_tuple{page_size};
+      IntTuple support_sliding_window{sliding_window_size_ != -1};
+      kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence_tuple, max_total_sequence_length_tuple,
+                                            prefill_chunk_size_tuple, page_size_tuple,
+                                            support_sliding_window);
+      local_kv_cache_ =
+          ft_.use_disco ? Downcast<DRef>(kv_cache_)->DebugGetFromRemote(0) : kv_cache_;
+    } else {
+      IntTuple max_num_sequence_tuple{max_num_sequence};
+      IntTuple max_history_size_tuple = {std::max(max_history_size, 1)};
+      kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence_tuple, max_history_size_tuple);
+      local_kv_cache_ =
+          ft_.use_disco ? Downcast<DRef>(kv_cache_)->DebugGetFromRemote(0) : kv_cache_;
+    }
   }
 
   void AddNewSequence(int64_t seq_id) final { ft_.kv_cache_add_sequence_func_(kv_cache_, seq_id); }
@@ -775,11 +796,21 @@ class ModelImpl : public ModelObj {
   /************** Raw Info Query **************/
 
   int GetNumAvailablePages() const final {
-    return ft_.kv_cache_get_num_available_pages_func_(local_kv_cache_);
+    if (this->kind == KVStateKind::kRNNState) {
+      // RNNState does not introduce new page at runtime
+      return std::numeric_limits<int>::max();
+    } else {
+      return ft_.kv_cache_get_num_available_pages_func_(local_kv_cache_);
+    }
   }
 
   int GetCurrentTotalSequenceLength() const final {
-    return ft_.kv_cache_get_total_sequence_length_func_(local_kv_cache_);
+    if (this->kind == KVStateKind::kRNNState) {
+      // RNNState does not have a total sequence length limit
+      return 0;
+    } else {
+      return ft_.kv_cache_get_total_sequence_length_func_(local_kv_cache_);
+    }
   }
 
   /*********************** Utilities  ***********************/
@@ -833,20 +864,21 @@ class ModelImpl : public ModelObj {
     // Allocate the hidden_states tensor.
     // Use the same function as embeddings.
     ObjectRef hidden_states = ft_.alloc_embedding_tensor_func_();
+    NDArray hidden_states_nd{nullptr};
     // Get the shape of the hidden_states tensor for hidden size.
-    ShapeTuple hidden_states_shape;
     if (ft_.use_disco) {
       ICHECK(hidden_states->IsInstance<DRefObj>());
-      ObjectRef shape_ref = ft_.nd_get_shape_func_(hidden_states);
-      hidden_states_shape = Downcast<DRef>(shape_ref)->DebugGetFromRemote(0);
+      hidden_states_nd = Downcast<DRef>(hidden_states)->DebugGetFromRemote(0);
     } else {
-      NDArray hidden_states_nd = Downcast<NDArray>(hidden_states);
-      hidden_states_shape = hidden_states_nd.Shape();
+      hidden_states_nd = Downcast<NDArray>(hidden_states);
     }
+    ShapeTuple hidden_states_shape = hidden_states_nd.Shape();
     ICHECK_EQ(hidden_states_shape.size(), 2);
     ICHECK_EQ(hidden_states_shape[0], prefill_chunk_size_);
     this->hidden_size_ = hidden_states_shape[1];
-    return hidden_states;
+    this->hidden_states_dtype_ = hidden_states_nd->dtype;
+    // TODO(wuwei): We can keep hidden_states on the worker after refactor
+    return hidden_states_nd;
   }
 
   void Reset() final {
@@ -854,6 +886,59 @@ class ModelImpl : public ModelObj {
     if (kv_cache_.defined()) {
       ft_.reset_kv_cache_func_(kv_cache_);
     }
+  }
+
+  /********************** Utilities for speculative decoding **********************/
+
+  DraftTokenWorkspaceManager CreateDraftTokenWorkspaceManager(int max_num_tokens) {
+    return DraftTokenWorkspaceManager(max_num_tokens, vocab_size_, hidden_size_,
+                                      hidden_states_dtype_, device_, ft_);
+  }
+
+  ObjectRef GatherHiddenStates(const ObjectRef& input, const std::vector<int>& indices,
+                               ObjectRef* dst) final {
+    NDArray dst_view = Downcast<NDArray>(*dst).CreateView(
+        {static_cast<int64_t>(indices.size()), hidden_size_}, hidden_states_dtype_);
+    NDArray indices_nd =
+        logit_pos_arr_.CreateView({static_cast<int64_t>(indices.size())}, DataType::Int(32));
+    indices_nd.CopyFromBytes(indices.data(), indices.size() * sizeof(int));
+    ObjectRef indices_device =
+        ft_.CopyToWorker0(indices_nd, "logit_pos_local", {max_num_sequence_}, /*local_only=*/true);
+    ft_.gather_hidden_states_func_(input, indices_device, dst_view);
+    return dst_view;
+  }
+
+  void ScatterHiddenStates(const ObjectRef& input, const std::vector<int>& indices,
+                           ObjectRef* dst) final {
+    NDArray indices_nd =
+        logit_pos_arr_.CreateView({static_cast<int64_t>(indices.size())}, DataType::Int(32));
+    indices_nd.CopyFromBytes(indices.data(), indices.size() * sizeof(int));
+    ObjectRef indices_device =
+        ft_.CopyToWorker0(indices_nd, "logit_pos_local", {max_num_sequence_}, /*local_only=*/true);
+    ft_.scatter_hidden_states_func_(input, indices_device, *dst);
+  }
+
+  NDArray GatherDraftProbs(const NDArray& input, const std::vector<int>& indices,
+                           NDArray* dst) final {
+    NDArray dst_view =
+        dst->CreateView({static_cast<int64_t>(indices.size()), vocab_size_}, DataType::Float(32));
+    NDArray indices_nd =
+        logit_pos_arr_.CreateView({static_cast<int64_t>(indices.size())}, DataType::Int(32));
+    indices_nd.CopyFromBytes(indices.data(), indices.size() * sizeof(int));
+    ObjectRef indices_device =
+        ft_.CopyToWorker0(indices_nd, "logit_pos_local", {max_num_sequence_}, /*local_only=*/true);
+    ft_.gather_probs_func_(input, indices_device, dst_view);
+    return dst_view;
+  }
+
+  void ScatterDraftProbs(const NDArray& input, const std::vector<int>& indices,
+                         NDArray* dst) final {
+    NDArray indices_nd =
+        logit_pos_arr_.CreateView({static_cast<int64_t>(indices.size())}, DataType::Int(32));
+    indices_nd.CopyFromBytes(indices.data(), indices.size() * sizeof(int));
+    ObjectRef indices_device =
+        ft_.CopyToWorker0(indices_nd, "logit_pos_local", {max_num_sequence_}, /*local_only=*/true);
+    ft_.scatter_probs_func_(input, indices_device, *dst);
   }
 
   /************** Debug/Profile **************/
@@ -864,15 +949,7 @@ class ModelImpl : public ModelObj {
 
  private:
   /*! \brief Load model configuration from JSON. */
-  picojson::object LoadModelConfigJSON(const std::string& config_str) {
-    picojson::value config_json;
-    std::string err = picojson::parse(config_json, config_str);
-    if (!err.empty()) {
-      LOG(FATAL) << err;
-    }
-
-    // Get json fields.
-    picojson::object config = config_json.get<picojson::object>();
+  picojson::object LoadModelConfigJSON(picojson::object config) {
     if (config.count("context_window_size")) {
       CHECK(config["context_window_size"].is<int64_t>());
       this->max_window_size_ = config["context_window_size"].get<int64_t>();
@@ -922,6 +999,7 @@ class ModelImpl : public ModelObj {
   int max_num_sequence_ = -1;
   int prefill_chunk_size_ = -1;
   int hidden_size_ = -1;
+  DLDataType hidden_states_dtype_;
   int vocab_size_ = -1;
   int image_embed_size_ = -1;
   //----------------------------
@@ -946,6 +1024,8 @@ class ModelImpl : public ModelObj {
   NDArray logit_pos_arr_{nullptr};
   // A boolean indicating if tracing is enabled.
   bool trace_enabled_;
+  // An enum indicating whether it's RNN-based.
+  KVStateKind kind;
 };
 
 TVM_REGISTER_GLOBAL("mlc.copy_embedding_to_offset")

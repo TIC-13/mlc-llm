@@ -15,6 +15,7 @@ from mlc_llm.support import logging
 from .attach_embedding_allocator import AttachAllocEmbeddingTensorFunc
 from .attach_logit_processor import AttachLogitProcessFunc
 from .attach_sampler import AttachGPUSamplingFunc
+from .attach_spec_decode_aux_funcs import AttachSpecDecodeAuxFuncs
 from .attach_support_info import (
     AttachAdditionalPrimFuncs,
     AttachCUDAGraphSymbolicCaptureHints,
@@ -33,6 +34,7 @@ from .fuse_ft_dequantize_matmul_epilogue import FuseFTDequantizeEpilogue
 from .fuse_transpose_matmul import FuseTransposeMatmul
 from .lift_global_buffer_alloc import LiftTIRGlobalBufferAlloc
 from .low_batch_specialization import LowBatchGemvSpecialize
+from .rewrite_softmax import RewriteTwoStageSoftmax
 from .scatter_tuple_get_item import ScatterTupleGetItem
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,7 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 AttachAdditionalPrimFuncs(additional_tirs),
                 AttachAllocEmbeddingTensorFunc(metadata),
                 AttachGPUSamplingFunc(target, variable_bounds),
+                AttachSpecDecodeAuxFuncs(),
                 AttachMemoryPlanAttr(),
                 tvm.tir.transform.BindTarget(tvm.target.Target.current(allow_none=False)),
                 _DebugDump("debug-phase0.py", debug_dump, show_meta=False),
@@ -117,6 +120,7 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 # Phase 2. Lowering to TIR, inherited TVM Relax's official "zero" pipeline
                 _LogProgress("Lowering to TVM TIR kernels"),
                 tvm.relax.backend.DispatchSortScan(),
+                RewriteTwoStageSoftmax(target=target),
                 tvm.relax.transform.LegalizeOps(),
                 tvm.relax.transform.AnnotateTIROpPattern(),
                 tvm.relax.transform.FoldConstant(),

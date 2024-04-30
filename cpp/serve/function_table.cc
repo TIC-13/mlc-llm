@@ -69,7 +69,8 @@ PackedFunc FunctionTable::SessionFuncAsPackedFunc(Session sess, DRef sess_func, 
   });
 }
 
-void FunctionTable::Init(String reload_lib_path, Device device, picojson::object model_config) {
+void FunctionTable::Init(String reload_lib_path, Device device, picojson::object model_config,
+                         Optional<Session> session) {
   local_gpu_device = device;
   Device null_device{DLDeviceType(0), 0};
   int num_shards;
@@ -85,33 +86,14 @@ void FunctionTable::Init(String reload_lib_path, Device device, picojson::object
   this->cached_buffers = Map<String, ObjectRef>();
 
   if (num_shards > 1) {
-    constexpr const char* f_create_process_pool = "runtime.disco.create_process_pool";
-    if (Registry::Get(f_create_process_pool) == nullptr) {
-      LOG(FATAL) << "Cannot find process launcher `" << f_create_process_pool << "`. "
-                 << "Multi-GPU inference depends on MLC LLM Python API to launch process.";
-    }
-    std::string ccl;
-    if (device.device_type == kDLCUDA) {
-      ccl = "nccl";
-    } else if (device.device_type == kDLROCM) {
-      ccl = "rccl";
-    } else {
-      LOG(FATAL) << "ValueError: Multi-GPU on device " << DLDeviceType2Str(device.device_type)
-                 << " is not supported. Currently, only NCCL and RCCL are integrated.";
-    }
-    std::vector<int64_t> device_ids(num_shards);
-    for (int i = 0; i < num_shards; ++i) {
-      device_ids[i] = i;
-    }
+    this->sess = session.value();
     this->use_disco = true;
-    this->sess = Session::ProcessSession(num_shards, f_create_process_pool, "mlc_llm.cli.worker");
-    this->sess->InitCCL(ccl, ShapeTuple(device_ids));
     this->disco_mod = sess->CallPacked(sess->GetGlobalFunc("runtime.disco.load_vm_module"),
                                        reload_lib_path, null_device);
     this->mod_get_func = [this,
                           fmodule_get_function = sess->GetGlobalFunc("runtime.ModuleGetFunction")](
                              const std::string& name) -> PackedFunc {
-      DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, false);
+      DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, true);
       bool exists = (func->DebugGetFromRemote(0).operator PackedFunc()) != nullptr;
       if (!exists) {
         return PackedFunc(nullptr);
@@ -244,7 +226,12 @@ void FunctionTable::_InitFunctions() {
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
   this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
   if (!this->create_kv_cache_func_.defined()) {
-    this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+    PackedFunc f_create_rnn_state = mod_get_func("create_rnn_state");
+    if (f_create_rnn_state.defined()) {
+      this->create_kv_cache_func_ = f_create_rnn_state;
+    } else {
+      this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+    }
     ICHECK(this->create_kv_cache_func_.defined());
   }
   this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
@@ -272,6 +259,11 @@ void FunctionTable::_InitFunctions() {
   this->nd_get_shape_func_ = get_global_func("vm.builtin.shape_of");
   this->nd_copy_embedding_to_offset_func_ = get_global_func("mlc.copy_embedding_to_offset");
   support_backtracking_kv_ = true;
+
+  this->gather_probs_func_ = mod->GetFunction("gather_probs", true);
+  this->scatter_probs_func_ = mod->GetFunction("scatter_probs", true);
+  this->gather_hidden_states_func_ = mod->GetFunction("gather_hidden_states", true);
+  this->scatter_hidden_states_func_ = mod->GetFunction("scatter_hidden_states", true);
 }
 
 ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) const {
@@ -285,8 +277,8 @@ ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) 
 }
 
 ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String buffer_cache_key,
-                                       ShapeTuple max_reserved_shape) {
-  if (this->use_disco) {
+                                       ShapeTuple max_reserved_shape, bool local_only) {
+  if (this->use_disco && !local_only) {
     Device null_device{DLDeviceType(0), 0};
     DRef buffer(nullptr);
     auto it = this->cached_buffers.find(buffer_cache_key);

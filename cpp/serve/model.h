@@ -12,6 +12,7 @@
 
 #include "../base.h"
 #include "config.h"
+#include "draft_token_workspace_manager.h"
 #include "event_trace_recorder.h"
 #include "function_table.h"
 #include "logit_processor.h"
@@ -40,10 +41,26 @@ struct ModelWorkspace {
    */
   ObjectRef embeddings{nullptr};
   /*!
-   * \brief The hidden_states tensor. It can be either an NDArray when tensor
+   * \brief The hidden_states tensor for the current batch. It can be either an NDArray when tensor
    * model parallelism is not enabled, or a DRef when using tensor model parallelism.
    */
   ObjectRef hidden_states{nullptr};
+
+  /*!
+   * \brief The draft token probabilities tensor for the current batch.
+   */
+  NDArray draft_probs{nullptr};
+
+  /*!
+   * \brief The hidden_states tensor storing the hidden_states of draft tokens of all requests.
+   */
+  ObjectRef draft_hidden_states_storage{nullptr};
+
+  /*!
+   * \brief The draft token probabilities tensor storing the probabilities of draft tokens of all
+   * requests.
+   */
+  NDArray draft_probs_storage{nullptr};
 };
 
 /*!
@@ -234,9 +251,13 @@ class ModelObj : public Object {
    * in the engine.
    * \param prefill_chunk_size The maximum total number of tokens whose KV data
    * are allowed to exist in the KV cache at any time.
+   * \param max_history_size The maximum history size for RNN state to roll back.
+   * The KV cache does not need this.
+   * \param kv_state_kind The kind of cache. It can be KV cache or RNN state.
    */
   virtual void CreateKVCache(int page_size, int max_num_sequence, int max_total_sequence_length,
-                             int prefill_chunk_size) = 0;
+                             int prefill_chunk_size, int max_history_size,
+                             KVStateKind kv_state_kind) = 0;
 
   /*! \brief Add a new sequence with the given sequence id to the KV cache. */
   virtual void AddNewSequence(int64_t seq_id) = 0;
@@ -298,6 +319,27 @@ class ModelObj : public Object {
   /*! \brief Reset the model KV cache and other statistics. */
   virtual void Reset() = 0;
 
+  /*********************** Utilities for speculative decoding. ***********************/
+
+  virtual DraftTokenWorkspaceManager CreateDraftTokenWorkspaceManager(int max_num_token) = 0;
+
+  /*! \brief Gather the hidden_states of the given indices and in-place update the dst tensor. */
+  virtual ObjectRef GatherHiddenStates(const ObjectRef& input, const std::vector<int>& indices,
+                                       ObjectRef* dst) = 0;
+
+  /*! \brief Scatter the hidden_states of the given indices to the dst tensor. */
+  virtual void ScatterHiddenStates(const ObjectRef& input, const std::vector<int>& indices,
+                                   ObjectRef* dst) = 0;
+
+  /*! \brief Gather the draft token probabilities of the given indices and in-place update the dst
+   * tensor. */
+  virtual NDArray GatherDraftProbs(const NDArray& input, const std::vector<int>& indices,
+                                   NDArray* dst) = 0;
+
+  /*! \brief Scatter the draft token probabilities of the given indices to the dst tensor. */
+  virtual void ScatterDraftProbs(const NDArray& input, const std::vector<int>& indices,
+                                 NDArray* dst) = 0;
+
   /************** Debug/Profile **************/
 
   /*! \brief Call the given global function on all workers. Only for debug purpose. */
@@ -315,13 +357,24 @@ class Model : public ObjectRef {
    * \brief Create the runtime module for LLM functions.
    * \param reload_lib_path The model library path.
    * \param model_path The path to the model weight parameters.
+   * \param model_config The model config json object.
    * \param device The device to run the model on.
    * \param max_num_sequence The maximum number of sequences to be processed
+   * \param session The session to run the model on.
    * \param trace_enabled A boolean indicating whether tracing is enabled.
    * \return The created runtime module.
    */
-  TVM_DLL static Model Create(String reload_lib_path, String model_path, DLDevice device,
-                              int max_num_sequence, bool trace_enabled);
+  TVM_DLL static Model Create(String reload_lib_path, String model_path,
+                              const picojson::object& model_config, DLDevice device,
+                              int max_num_sequence, const Optional<Session>& session,
+                              bool trace_enabled);
+
+  /*!
+   * Load the model config from the given model path.
+   * \param model_path The path to the model weight parameters.
+   * \return The model config json object.
+   */
+  static picojson::object LoadModelConfig(const String& model_path);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(Model, ObjectRef, ModelObj);
 };

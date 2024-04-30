@@ -100,7 +100,7 @@ class NewRequestPrefillActionObj : public EngineActionObj {
         }
 
         ICHECK(mstate->draft_output_tokens.empty());
-        ICHECK(mstate->draft_output_prob_dist.empty());
+        ICHECK(mstate->draft_token_slots.empty());
         if (status_before_prefill[i] == RequestStateStatus::kPending) {
           // Add the sequence to the model, or fork the sequence from its parent.
           if (rsentry->parent_idx == -1) {
@@ -395,6 +395,11 @@ class NewRequestPrefillActionObj : public EngineActionObj {
                   int num_required_pages, int num_available_pages, int current_total_seq_len,
                   int num_running_rsentries) {
     ICHECK_LE(num_running_rsentries, engine_config_->max_num_sequence);
+
+    // For RNN State, it can prefill as long as it can be instantiated.
+    if (engine_config_->kv_state_kind == KVStateKind::kRNNState) {
+      return true;
+    }
 
     // No exceeding of the maximum allowed requests that can
     // run simultaneously.

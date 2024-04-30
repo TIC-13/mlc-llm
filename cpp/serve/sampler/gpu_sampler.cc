@@ -51,6 +51,9 @@ class GPUSampler : public SamplerObj {
     ICHECK(gpu_sample_with_top_p_func_.defined());
     ICHECK(gpu_sampler_take_probs_func_.defined());
 
+    flashinfer_multinomial_sample_func_ =
+        Registry::Get("flashinfer.sampling.parallel_sampling_from_prob");
+
     DLDevice device_cpu{DLDeviceType::kDLCPU, /*device_id=*/0};
     // We support at most 5 top prob results for each sequence.
     // Initialize auxiliary arrays on CPU.
@@ -76,6 +79,7 @@ class GPUSampler : public SamplerObj {
     token_tree_first_child_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
     token_tree_next_sibling_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
     token_tree_parent_ptr_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
+    sampled_token_ids_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
 
     // If the device is CUDA/ROCm, we create a standalone copy stream, in
     // purpose to hide the latency of auxiliary stream copy.
@@ -163,7 +167,7 @@ class GPUSampler : public SamplerObj {
       const std::vector<int>& cum_verify_lengths, const Array<GenerationConfig>& generation_cfg,
       const std::vector<RandomGenerator*>& rngs,
       const std::vector<std::vector<SampleResult>>& draft_output_tokens,
-      const std::vector<std::vector<NDArray>>& draft_output_prob_dist) final {
+      NDArray draft_probs_on_device) final {
     NVTXScopedRange nvtx_scope("BatchVerifyDraftTokensWithProbAfterTopP");
     std::vector<std::vector<SampleResult>> sample_results;
     // probs_on_device: (n, v)
@@ -173,38 +177,27 @@ class GPUSampler : public SamplerObj {
     int num_sequence = static_cast<int>(cum_verify_lengths.size()) - 1;
     CHECK_EQ(rngs.size(), num_sequence);
     CHECK_EQ(draft_output_tokens.size(), num_sequence);
-    CHECK_EQ(draft_output_prob_dist.size(), num_sequence);
     sample_results.resize(num_sequence);
 
     int num_nodes = cum_verify_lengths.back();
+    CHECK_EQ(draft_probs_on_device->shape[0], num_nodes);
     NDArray uniform_samples_host = uniform_samples_host_.CreateView({num_nodes}, dtype_f32_);
     NDArray uniform_samples_device = uniform_samples_device_.CreateView({num_nodes}, dtype_f32_);
-    NDArray draft_probs_device =
-        draft_probs_device_.CreateView({num_nodes, vocab_size_}, dtype_f32_);
     NDArray draft_tokens_host = draft_tokens_host_.CreateView({num_nodes}, dtype_i32_);
     NDArray draft_tokens_device = draft_tokens_device_.CreateView({num_nodes}, dtype_i32_);
 
-    // Concat draft prob distributions to a ragged tensor (num_nodes, vocab_size)
+    // Copy draft tokens to GPU
+    int* p_draft_tokens_host = static_cast<int*>(draft_tokens_host->data);
     for (int i = 0; i < num_sequence; i++) {
       const std::vector<SampleResult>& draft_output_tokens_i = draft_output_tokens[i];
-      const std::vector<NDArray>& draft_output_prob_dist_i = draft_output_prob_dist[i];
       int start = cum_verify_lengths[i];
       int end = cum_verify_lengths[i + 1];
       // start/end is the range of the sequence i in probs_on_device, which includes the prob dist
       // of the draft tokens and the last committed token
       ICHECK_EQ(draft_output_tokens_i.size() + 1, end - start);
-      ICHECK_EQ(draft_output_prob_dist_i.size() + 1, end - start);
       for (int j = 0; j < end - start - 1; j++) {
-        // Copy prob dist
-        ICHECK_EQ(draft_probs_device->dtype.bits, 32);
-        float* p_draft_probs =
-            static_cast<float*>(draft_probs_device->data) +
-            (j + start + 1) *
-                vocab_size_;  // shift by one, q of the last committed token is undefined
         // Copy sampled token id
-        draft_output_prob_dist_i[j].CopyToBytes(p_draft_probs, vocab_size_ * sizeof(float));
-        *(static_cast<int*>(draft_tokens_host->data) + j + start + 1) =
-            draft_output_tokens_i[j].sampled_token_id.first;
+        p_draft_tokens_host[start + j + 1] = draft_output_tokens_i[j].sampled_token_id.first;
       }
     }
     CopyArray(draft_tokens_host, draft_tokens_device, copy_stream_);
@@ -258,7 +251,7 @@ class GPUSampler : public SamplerObj {
 
     SyncCopyStream(device_, compute_stream_, copy_stream_);
 
-    gpu_verify_draft_tokens_func_(draft_probs_device, draft_tokens_device, probs_on_device,
+    gpu_verify_draft_tokens_func_(draft_probs_on_device, draft_tokens_device, probs_on_device,
                                   token_tree_first_child_device, token_tree_next_sibling_device,
                                   uniform_samples_device, token_tree_parent_ptr_device);
 
@@ -311,13 +304,19 @@ class GPUSampler : public SamplerObj {
     int vocab_size = probs_on_device->shape[1];
     if (output_prob_dist != nullptr) {
       ICHECK(output_prob_dist->empty());
-      output_prob_dist->reserve(num_probs);
-      for (int i = 0; i < num_probs; ++i) {
+      output_prob_dist->reserve(num_samples);
+      for (int i = 0; i < num_samples; ++i) {
         NDArray prob_dist = NDArray::Empty({vocab_size}, dtype_f32_, device_);
-        float* p_prob = static_cast<float*>(probs_on_device->data) + i * vocab_size;
+        float* p_prob = static_cast<float*>(probs_on_device->data) + sample_indices[i] * vocab_size;
         prob_dist.CopyFromBytes(p_prob, vocab_size * sizeof(float));
         output_prob_dist->push_back(std::move(prob_dist));
       }
+    }
+    if (num_samples == 0) {
+      // This synchronization is necessary for making sure that this round
+      // of model forward is finished.
+      TVMSynchronize(device_.device_type, device_.device_id, compute_stream_);
+      return {};
     }
     ICHECK_EQ(request_ids.size(), num_samples);
     ICHECK_EQ(generation_cfg.size(), num_samples);
@@ -489,8 +488,15 @@ class GPUSampler : public SamplerObj {
     if (!need_top_p && !need_prob_values) {
       // - Short path: If top_p and prob values are not needed, we directly sample from multinomial.
       SyncCopyStream(device_, compute_stream_, copy_stream_);
-      sampled_token_ids_device = gpu_multinomial_from_uniform_func_(
-          probs_on_device, uniform_samples_device, sample_indices_device);
+      if (flashinfer_multinomial_sample_func_ != nullptr) {
+        sampled_token_ids_device =
+            sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
+        (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,
+                                               sample_indices_device, sampled_token_ids_device);
+      } else {
+        sampled_token_ids_device = gpu_multinomial_from_uniform_func_(
+            probs_on_device, uniform_samples_device, sample_indices_device);
+      }
       return {sampled_token_ids_device, sampled_probs_device, top_prob_probs_device,
               top_prob_indices_device};
     }
@@ -525,8 +531,15 @@ class GPUSampler : public SamplerObj {
                                       uniform_samples_device, sample_indices_device, top_p_device);
     } else {
       // - Sample without top_p.
-      sampled_token_ids_device = gpu_multinomial_from_uniform_func_(
-          probs_on_device, uniform_samples_device, sample_indices_device);
+      if (flashinfer_multinomial_sample_func_ != nullptr) {
+        sampled_token_ids_device =
+            sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
+        (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,
+                                               sample_indices_device, sampled_token_ids_device);
+      } else {
+        sampled_token_ids_device = gpu_multinomial_from_uniform_func_(
+            probs_on_device, uniform_samples_device, sample_indices_device);
+      }
     }
 
     if (need_prob_values) {
@@ -580,7 +593,7 @@ class GPUSampler : public SamplerObj {
     }
 
     // Synchronize for CPU to get the correct array results.
-    TVMSynchronize(device_.device_type, device_.device_id, nullptr);
+    TVMSynchronize(device_.device_type, device_.device_id, compute_stream_);
 
     return {sampled_token_ids_host, sampled_probs_host, top_prob_probs_host, top_prob_indices_host};
   }
@@ -598,6 +611,7 @@ class GPUSampler : public SamplerObj {
   PackedFunc gpu_sampler_take_probs_func_;
   PackedFunc gpu_verify_draft_tokens_func_;
   PackedFunc gpu_renormalize_by_top_p_func_;
+  const PackedFunc* flashinfer_multinomial_sample_func_;
   // Auxiliary NDArrays on CPU
   NDArray uniform_samples_host_;
   NDArray sample_indices_host_;
@@ -621,6 +635,7 @@ class GPUSampler : public SamplerObj {
   NDArray token_tree_first_child_device_;
   NDArray token_tree_next_sibling_device_;
   NDArray token_tree_parent_ptr_device_;
+  NDArray sampled_token_ids_device_;
   // The event trace recorder for requests. */
   Optional<EventTraceRecorder> trace_recorder_;
   // The device stream for the default computation operations.

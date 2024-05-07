@@ -64,9 +64,20 @@ class Phi1Config(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     "provided in `config.json`."
                 )
         if self.prefill_chunk_size == 0:
-            self.prefill_chunk_size = self.context_window_size
-        if self.prefill_chunk_size > self.context_window_size:
-            self.prefill_chunk_size = self.context_window_size
+            logger.info(
+                "%s defaults to %d",
+                bold("prefill_chunk_size"),
+                min(self.context_window_size, 2048),
+            )
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
+        elif self.prefill_chunk_size > self.context_window_size:
+            logger.info(
+                "Overriding %s from %d to %d",
+                bold("prefill_chunk_size"),
+                self.prefill_chunk_size,
+                min(self.context_window_size, 2048),
+            )
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
         if self.num_key_value_heads == 0 or self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.intermediate_size == 0 or self.intermediate_size is None:
@@ -377,9 +388,6 @@ class PhiForCausalLM(nn.Module):
         logits = self.batch_forward(input_embeds, paged_kv_cache)
         return logits, paged_kv_cache
 
-    def softmax_with_temperature(self, logits: Tensor, temperature: Tensor):
-        return op.softmax(logits / op.reshape(temperature, (temperature.shape[0], 1, 1)), axis=-1)
-
     def embed(self, input_ids: Tensor):
         if self.tensor_parallel_shards > 1:
             input_ids = op.ccl_broadcast_from_worker0(input_ids)
@@ -458,14 +466,6 @@ class PhiForCausalLM(nn.Module):
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",
-                    "effect_mode": "none",
-                },
-            },
-            "softmax_with_temperature": {
-                "logits": nn.spec.Tensor(["batch_size", 1, "vocab_size"], "float32"),
-                "temperature": nn.spec.Tensor(["batch_size"], "float32"),
-                "$": {
-                    "param_mode": "none",
                     "effect_mode": "none",
                 },
             },

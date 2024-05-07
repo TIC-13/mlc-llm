@@ -135,7 +135,7 @@ void FunctionTable::Init(String reload_lib_path, Device device, picojson::object
         static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled), static_cast<int>(kDLCPU), 0,
         static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled));
     this->mod_get_func = [this](const std::string& name) -> PackedFunc {
-      return this->local_vm->GetFunction(name, false);
+      return this->local_vm->GetFunction(name, true);
     };
     this->get_global_func = [](const std::string& name) -> PackedFunc {
       const auto* f = tvm::runtime::Registry::Get(name);
@@ -218,7 +218,7 @@ void FunctionTable::_InitFunctions() {
   Module mod = this->use_disco ? this->disco_mod->DebugGetFromRemote(0) : this->local_vm;
   this->get_logits_func_ = mod_get_func("get_logits");
   this->batch_get_logits_func_ = mod_get_func("batch_get_logits");
-  this->batch_select_last_hidden_func_ = mod->GetFunction("batch_select_last_hidden_states", true);
+  this->batch_select_last_hidden_func_ = mod_get_func("batch_select_last_hidden_states");
   this->softmax_func_ = mod->GetFunction("softmax_with_temperature", true);
   this->apply_logit_bias_func_ = mod->GetFunction("apply_logit_bias_inplace", true);
   this->apply_penalty_func_ = mod->GetFunction("apply_penalty_inplace", true);
@@ -259,11 +259,12 @@ void FunctionTable::_InitFunctions() {
   this->nd_get_shape_func_ = get_global_func("vm.builtin.shape_of");
   this->nd_copy_embedding_to_offset_func_ = get_global_func("mlc.copy_embedding_to_offset");
   support_backtracking_kv_ = true;
+  this->tuple_getitem_func_ = get_global_func("vm.builtin.tuple_getitem");
 
   this->gather_probs_func_ = mod->GetFunction("gather_probs", true);
   this->scatter_probs_func_ = mod->GetFunction("scatter_probs", true);
-  this->gather_hidden_states_func_ = mod->GetFunction("gather_hidden_states", true);
-  this->scatter_hidden_states_func_ = mod->GetFunction("scatter_hidden_states", true);
+  this->gather_hidden_states_func_ = mod_get_func("gather_hidden_states");
+  this->scatter_hidden_states_func_ = mod_get_func("scatter_hidden_states");
 }
 
 ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) const {

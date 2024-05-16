@@ -2,6 +2,8 @@
 
 ```bash
 git clone --recursive --jobs=8 git@github.com:TIC-13/mlc-llm.git
+cd mlc-llm
+git clone --recursive --jobs=8 git@github.com:mlc-ai/relax.git tvm-unity && cd tvm-unity
 ```
 
 ---
